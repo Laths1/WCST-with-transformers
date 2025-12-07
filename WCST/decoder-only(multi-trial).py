@@ -1,0 +1,772 @@
+"""
+WCST Transformer 
+Key features:
+- Multi-trial context for in-context learning
+- Masked loss computation
+"""
+
+import math
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import gc
+import sys
+import os
+import matplotlib.pyplot as plt
+import pandas as pd
+import seaborn as sns
+
+# setup
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+    try:
+        gpu_name = torch.cuda.get_device_name(0)
+    except Exception:
+        gpu_name = "CUDA Device"
+    print(f"Using CUDA: {gpu_name}")
+    mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    print(f"GPU Memory: {mem_gb:.1f} GB")
+else:
+    device = torch.device("cpu")
+    print("WARNING: Using CPU - training will be very slow!")
+
+#Constants
+SEP = 68
+EOS = 69
+LABEL_BASE = 64
+
+#Hyperparameters
+TRAINING_SIZE = 30_000
+NUM_CONTEXT_TRIALS = 4
+BATCH_SIZE = 32
+ACCUMULATION_STEPS = 2  # Effective batch = 32 * 2 = 64
+
+VOCAB_SIZE = 70
+D_MODEL = 256
+NUM_HEADS = 8
+NUM_LAYERS = 6
+D_FF = 1024
+DROPOUT = 0.1
+
+LEARNING_RATE = 1e-4
+EPOCHS = 20
+PATIENCE = 10
+WEIGHT_DECAY = 0.01
+
+# Data splits
+TRAIN_SPLIT = 0.7
+VAL_SPLIT = 0.15
+TEST_SPLIT = 0.15
+
+CONTEXT_SWITCH_INTERVAL = 10_000
+
+#Datat Generator
+class MultiTrialWCST:
+    """
+    Generates multi-trial sequences for WCST task where each sequence has K context trials (with answers) + 1 question trial.
+    """
+    def __init__(self, num_context_trials=4, context_switch_interval=10000):
+        self.colours = ['red','blue','green','yellow']
+        self.shapes = ['circle','square','star','cross']
+        self.quantities = ['1','2','3','4']
+        self.categories = ['C1','C2','C3','C4']
+        self.cards = self._build_cards()
+        self.num_context_trials = int(num_context_trials)
+        self.context_switch_interval = int(context_switch_interval)
+        self.rule_feature = 0  # 0=colour, 1=shape, 2=quantity
+        self._seq_counter = 0
+
+    def _build_cards(self):
+        """Build deck of 64 cards"""
+        cards = []
+        for colour in self.colours:
+            for shape in self.shapes:
+                for quantity in self.quantities:
+                    cards.append((colour, shape, quantity))
+        return np.array(cards)
+
+    @staticmethod
+    def card_features(idx):
+        """Extract (colour, shape, quantity) features from card index"""
+        qty = idx % 4
+        shp = (idx // 4) % 4
+        col = (idx // 16) % 4
+        return (col, shp, qty)
+
+    def _category_cards_for_rule(self, rule_feat):
+        """Get 4 category cards representing each feature value"""
+        cat_cards = []
+        for fval in range(4):
+            for idx in range(64):
+                f = self.card_features(idx)
+                if f[rule_feat] == fval:
+                    cat_cards.append(idx)
+                    break
+        return cat_cards
+
+    def _label_for_example(self, rule_feat, example_idx):
+        """Determine which category (0-3) the example belongs to"""
+        f = self.card_features(example_idx)
+        return f[rule_feat]
+
+    def _one_trial_segment(self, rule_feat):
+        """
+        Generate one trial segment:
+        [cat0, cat1, cat2, cat3, example_card, SEP, label, EOS]
+        """
+        cats = self._category_cards_for_rule(rule_feat)
+        ex_card = np.random.randint(0, 64)
+        label_val = self._label_for_example(rule_feat, ex_card)
+        label_tok = LABEL_BASE + label_val
+        seg = cats + [ex_card, SEP, label_tok, EOS]
+        return seg
+
+    def _question_segment(self, rule_feat):
+        """
+        Generate question trial (includes answer for training):
+        [cat0, cat1, cat2, cat3, question_card, SEP, label, EOS]
+        """
+        cats = self._category_cards_for_rule(rule_feat)
+        q_card = np.random.randint(0, 64)
+        label_val = self._label_for_example(rule_feat, q_card)
+        label_tok = LABEL_BASE + label_val
+        seg = cats + [q_card, SEP, label_tok, EOS]
+        return seg, label_tok
+
+    def gen_sequence(self):
+        """
+        Generate complete multi-trial sequence.
+        Returns:
+            seq: List of token IDs
+            sep_mask: Mask for positions after SEP (where we compute loss)
+            final_label: Label of the question trial (for final accuracy)
+        """
+        #Context switch 
+        if self._seq_counter != 0 and (self._seq_counter % self.context_switch_interval == 0):
+            choices = [0, 1, 2]
+            choices.remove(self.rule_feature)
+            self.rule_feature = np.random.choice(choices)
+
+        rule_feat = self.rule_feature
+        seq = []
+        
+        #Generate K context trials with answers
+        for _ in range(self.num_context_trials):
+            seg = self._one_trial_segment(rule_feat)
+            seq += seg
+
+        #Generate question trial
+        qseg, q_label = self._question_segment(rule_feat)
+        seq += qseg
+
+        #Create mask for loss computation (1 at positions after SEP)
+        sep_mask = [0] * len(seq)
+        for i in range(1, len(seq)):
+            if seq[i-1] == SEP:
+                sep_mask[i] = 1
+
+        self._seq_counter += 1
+        return seq, sep_mask, q_label
+
+
+class MultiTrialDatasetLoader:
+    def __init__(self, training_size, train_split=0.7, val_split=0.15, test_split=0.15,
+                 num_context_trials=4, context_switch_interval=10000, batch_size=64):
+        self.training_size = training_size
+        self.train_split = train_split
+        self.val_split = val_split
+        self.test_split = test_split
+        self.num_context_trials = num_context_trials
+        self.context_switch_interval = context_switch_interval
+        self.batch_size = batch_size
+
+    def load_data(self):
+        """Generate and split data into train/val/test"""
+        print(f"\nGenerating {self.training_size} sequences...")
+        print(f"Context trials per sequence: {self.num_context_trials}")
+        
+        env = MultiTrialWCST(
+            num_context_trials=self.num_context_trials,
+            context_switch_interval=self.context_switch_interval
+        )
+
+        seqs = []
+        masks = []
+        finals = []
+        
+        #tracking
+        checkpoint = max(1, self.training_size // 20)
+        
+        for i in range(self.training_size):
+            if i % checkpoint == 0:
+                pct = 100 * i / self.training_size
+                print(f"  Progress: {i}/{self.training_size} ({pct:.1f}%)")
+                sys.stdout.flush()
+                
+                # Periodic garbage collection
+                if i > 0 and i % (checkpoint * 5) == 0:
+                    gc.collect()
+            
+            s, m, f = env.gen_sequence()
+            seqs.append(s)
+            masks.append(m)
+            finals.append(f)
+
+        print("  Padding sequences...")
+        max_len = max(len(s) for s in seqs)
+        print(f"  Max sequence length: {max_len}")
+        
+        def pad(arr, pad_value):
+            return [x + [pad_value] * (max_len - len(x)) for x in arr]
+
+        input_ids = pad([s[:-1] for s in seqs], EOS)
+        target_ids = pad([s[1:] for s in seqs], EOS)
+        sep_mask = pad([m[1:] for m in masks], 0)
+        
+        
+        final_mask = []
+        for m in sep_mask:
+            idx = len(m) - 1 - next((i for i, v in enumerate(reversed(m)) if v == 1), 0)
+            fm = [0] * len(m)
+            fm[idx] = 1
+            final_mask.append(fm)
+
+        print("  Converting to tensors...")
+        X = torch.tensor(input_ids, dtype=torch.long)
+        Y = torch.tensor(target_ids, dtype=torch.long)
+        M = torch.tensor(sep_mask, dtype=torch.bool)
+        F = torch.tensor(final_mask, dtype=torch.bool)
+
+        del seqs, masks, finals, input_ids, target_ids, sep_mask, final_mask
+        gc.collect()
+
+        n = X.size(0)
+        n_train = int(self.train_split * n)
+        n_val = int(self.val_split * n)
+        idx = np.arange(n)
+        np.random.shuffle(idx)
+
+        X = X[idx]; Y = Y[idx]; M = M[idx]; F = F[idx]
+        
+        Xtr, Ytr, Mtr, Ftr = X[:n_train], Y[:n_train], M[:n_train], F[:n_train]
+        Xva, Yva, Mva, Fva = X[n_train:n_train+n_val], Y[n_train:n_train+n_val], M[n_train:n_train+n_val], F[n_train:n_train+n_val]
+        Xte, Yte, Mte, Fte = X[n_train+n_val:], Y[n_train+n_val:], M[n_train+n_val:], F[n_train+n_val:]
+
+        train = TensorDataset(Xtr, Ytr, Mtr, Ftr)
+        val = TensorDataset(Xva, Yva, Mva, Fva)
+        test = TensorDataset(Xte, Yte, Mte, Fte)
+
+        print(f"  Train: {len(train)}, Val: {len(val)}, Test: {len(test)}")
+        return train, val, test, max_len
+
+
+#MODEL 
+class TokenEmbedding(nn.Module):
+    def __init__(self, vocab_size, d_model):
+        super().__init__()
+        self.emb = nn.Embedding(vocab_size, d_model)
+        self.scale = math.sqrt(d_model)
+    
+    def forward(self, x):
+        return self.emb(x) * self.scale
+
+
+class PositionalEncoder(nn.Module):
+    """Sinusoidal positional encoding"""
+    def __init__(self, d_model, max_len=2048):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float) * (-math.log(10000.0)/d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer("pe", pe)
+    
+    def forward(self, x):
+        T = x.size(1)
+        return self.pe[:T].unsqueeze(0)
+
+
+class MultiHeadAttention(nn.Module):
+    """Multi-head self-attention with causal masking.
+    """
+    def __init__(self, d_model, num_heads, dropout=0.1):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.h = num_heads
+        self.dh = d_model // num_heads
+        self.Wq = nn.Linear(d_model, d_model, bias=True)
+        self.Wk = nn.Linear(d_model, d_model, bias=True)
+        self.Wv = nn.Linear(d_model, d_model, bias=True)
+        self.Wo = nn.Linear(d_model, d_model, bias=True)
+        self.drop = nn.Dropout(dropout)
+
+    def _shape(self, x):
+        B, T, C = x.shape
+        return x.view(B, T, self.h, self.dh).transpose(1, 2)
+
+    def forward(self, x, causal=True):
+        q = self._shape(self.Wq(x))
+        k = self._shape(self.Wk(x))
+        v = self._shape(self.Wv(x))
+        
+        logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.dh)
+
+        # Causal mask
+        if causal:
+            T = x.size(1)
+            i = torch.arange(T, device=x.device).unsqueeze(1)
+            j = torch.arange(T, device=x.device).unsqueeze(0)
+            mask = j <= i
+            logits = logits.masked_fill(~mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+
+        w = torch.softmax(logits, dim=-1)
+        w = self.drop(w)
+        ctx = torch.matmul(w, v)
+        ctx = ctx.transpose(1, 2).contiguous().view(x.size(0), x.size(1), -1)
+        out = self.Wo(ctx)
+        return out, w
+
+
+class FeedForward(nn.Module):
+    """Position-wise feed-forward network"""
+    def __init__(self, d_model, d_ff, dropout=0.1):
+        super().__init__()
+        self.fc1 = nn.Linear(d_model, d_ff)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(d_ff, d_model)
+    
+    def forward(self, x):
+        return self.fc2(self.drop(self.act(self.fc1(x))))
+
+
+class DecoderLayer(nn.Module):
+    def __init__(self, d_model, num_heads, d_ff, dropout):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(d_model)
+        self.attn = MultiHeadAttention(d_model, num_heads, dropout)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.ff = FeedForward(d_model, d_ff, dropout)
+        self.drop = nn.Dropout(dropout)
+    
+    def forward(self, x, return_attn=False):
+        h, w = self.attn(self.ln1(x), causal=True)
+        x = x + self.drop(h)
+        x = x + self.drop(self.ff(self.ln2(x)))
+        if return_attn:
+            return x, w
+        return x, None
+
+
+class TransformerDecoderOnly(nn.Module):
+    """Decoder-only transformer for WCST"""
+    def __init__(self, num_layers, d_model, num_heads, d_ff, 
+                 vocab_size, max_len=1024, dropout=0.1):
+        super().__init__()
+        self.emb = TokenEmbedding(vocab_size, d_model)
+        self.pos = PositionalEncoder(d_model, max_len)
+        self.layers = nn.ModuleList([
+            DecoderLayer(d_model, num_heads, d_ff, dropout)
+            for _ in range(num_layers)
+        ])
+        self.fc_out = nn.Linear(d_model, vocab_size, bias=False)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x, return_attn=False):
+        attn_maps_all = [] if return_attn else None
+        h = self.emb(x) + self.pos(x).to(x.device)
+        h = self.drop(h)
+        for lyr in self.layers:
+            h, w = lyr(h, return_attn=return_attn)
+            if return_attn:
+                attn_maps_all.append(w)  # (B, H, T, T)
+        logits = self.fc_out(h)
+        if return_attn:
+            return logits, attn_maps_all
+        return logits
+
+#Training
+class ImprovedWCSTTrainer:
+    def __init__(self, model, train_data, val_data, test_data,
+                 lr=1e-4, batch_size=64, patience=10, epochs=100,
+                 weight_decay=0.01, accumulation_steps=1):
+        self.model = model.to(device)
+        self.batch_size = batch_size
+        self.accumulation_steps = accumulation_steps
+        
+        self.train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
+        self.val_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False)
+        self.test_loader = DataLoader(test_data, batch_size=batch_size, shuffle=False)
+
+        self.crit = nn.CrossEntropyLoss(reduction='none')
+        self.opt = optim.AdamW(self.model.parameters(), lr=lr, 
+                               weight_decay=weight_decay, betas=(0.9, 0.98), eps=1e-8)
+        self.patience = patience
+        self.epochs = epochs
+        self.best_val = float('inf')
+        self.no_improve = 0
+
+        # Metrics history
+        self.tr_losses, self.va_losses = [], []
+        self.tr_masked_accs, self.va_masked_accs = [], []
+        self.tr_final_accs, self.va_final_accs = [], []
+
+    @staticmethod
+    def _masked_loss(logits, targets, mask):
+        """Compute loss only at masked positions (after SEP tokens)"""
+        B, T, V = logits.shape
+        loss_all = nn.functional.cross_entropy(
+            logits.reshape(B*T, V),
+            targets.reshape(B*T),
+            reduction='none'
+        ).reshape(B, T)
+        loss = (loss_all * mask.float()).sum() / (mask.float().sum().clamp_min(1.0))
+        return loss
+
+    @staticmethod
+    def _masked_accuracy(logits, targets, mask):
+        """Accuracy at all masked positions"""
+        pred = logits.argmax(dim=-1)
+        correct = ((pred == targets) & mask).sum().item()
+        total = mask.sum().item()
+        return correct / total if total > 0 else 0.0
+
+    @staticmethod
+    def _final_accuracy(logits, targets, final_mask):
+        """Accuracy at final trial only (what we care about most)"""
+        pred = logits.argmax(dim=-1)
+        correct = ((pred == targets) & final_mask).sum().item()
+        total = final_mask.sum().item()
+        return correct / total if total > 0 else 0.0
+
+    def _run_epoch(self, loader, train):
+        """Runs an epoch of training or evaluation"""
+        if train:
+            self.model.train()
+        else:
+            self.model.eval()
+
+        total_loss = 0.0
+        total_masked_acc = 0.0
+        total_final_acc = 0.0
+        batches = 0
+
+        #tracking
+        num_batches = len(loader)
+        print_every = max(1, num_batches // 10)
+
+        if train:
+            self.opt.zero_grad()
+
+        for batch_idx, (X, Y, M, F) in enumerate(loader):
+            X, Y, M, F = X.to(device), Y.to(device), M.to(device), F.to(device)
+            
+            with torch.set_grad_enabled(train):
+                logits = self.model(X)
+                loss = self._masked_loss(logits, Y, M)
+                
+                if train:
+                    loss = loss / self.accumulation_steps
+                    loss.backward()
+                    
+                    if (batch_idx + 1) % self.accumulation_steps == 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                        self.opt.step()
+                        self.opt.zero_grad()
+
+            masked_acc = self._masked_accuracy(logits, Y, M)
+            final_acc = self._final_accuracy(logits, Y, F)
+
+            total_loss += loss.item() * self.accumulation_steps
+            total_masked_acc += masked_acc
+            total_final_acc += final_acc
+            batches += 1
+
+            if train and (batch_idx + 1) % print_every == 0:
+                avg_loss = loss.item() * self.accumulation_steps
+                print(f"  Batch {batch_idx+1}/{num_batches} | "
+                      f"Loss: {avg_loss:.4f} | FinalAcc: {final_acc:.3f}")
+                sys.stdout.flush()
+
+            if torch.cuda.is_available() and batch_idx % 50 == 0:
+                torch.cuda.empty_cache()
+
+        return (total_loss / batches,
+                total_masked_acc / batches,
+                total_final_acc / batches)
+
+    def _plot_training(self):
+        epochs = range(1, len(self.tr_losses)+1)
+        plt.figure(figsize=(12,4))
+
+        plt.subplot(1,2,1)
+        plt.plot(epochs, self.tr_losses, label='Train Loss')
+        plt.plot(epochs, self.va_losses, label='Val Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Loss')
+        plt.legend()
+
+        plt.subplot(1,2,2)
+        plt.plot(epochs, self.tr_final_accs, label='Train Final Acc')
+        plt.plot(epochs, self.va_final_accs, label='Val Final Acc')
+        plt.xlabel('Epoch')
+        plt.ylabel('Accuracy')
+        plt.title('Final-Trial Accuracy')
+        plt.legend()
+
+        plt.tight_layout()
+        plt.savefig('training_curves.png', dpi=150)
+        plt.close()
+
+    def evaluate_test(self):
+        self.model.load_state_dict(torch.load("best_wcst_multi.pth", map_location=device))
+        self.model.eval()
+        test_loss, test_macc, test_facc = self._run_epoch(self.test_loader, train=False)
+        print(f"\nTEST Results: loss={test_loss:.4f}, masked_acc={test_macc:.3f}, final_acc={test_facc:.3f}")
+        return test_loss, test_macc, test_facc
+
+    def train(self):
+        """Training method"""
+        print("\n" + "="*60)
+        print("TRAINING START")
+        print("="*60)
+        
+        for ep in range(1, self.epochs+1):
+            print(f"\nEpoch {ep}/{self.epochs}")
+            print("-"*60)
+            
+            tr_loss, tr_macc, tr_facc = self._run_epoch(self.train_loader, train=True)
+            va_loss, va_macc, va_facc = self._run_epoch(self.val_loader, train=False)
+
+            self.tr_losses.append(tr_loss); self.va_losses.append(va_loss)
+            self.tr_masked_accs.append(tr_macc); self.va_masked_accs.append(va_macc)
+            self.tr_final_accs.append(tr_facc); self.va_final_accs.append(va_facc)
+
+            print(f"\nEpoch {ep:03d} Summary:")
+            print(f"  Train: loss={tr_loss:.4f}, masked_acc={tr_macc:.3f}, final_acc={tr_facc:.3f}")
+            print(f"  Val:   loss={va_loss:.4f}, masked_acc={va_macc:.3f}, final_acc={va_facc:.3f}")
+
+            if va_loss + 1e-6 < self.best_val:
+                self.best_val = va_loss
+                self.no_improve = 0
+                torch.save(self.model.state_dict(), "best_wcst_multi.pth")
+                print("A new best model saved!")
+            else:
+                self.no_improve += 1
+                print(f"  No improvement for {self.no_improve} epoch(s)")
+                if self.no_improve >= self.patience:
+                    print(f"\n Early stopping at epoch {ep}")
+                    break
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+
+        torch.save(self.model.state_dict(), "final_weights.pth")
+        print("Final weights saved -> final_weights.pth")
+
+        # Plot curves
+        self._plot_training()
+        print("Training curves saved -> training_curves.png")
+
+        # Final test evaluation on the best checkpoint
+        self.evaluate_test()
+
+
+class RuleDetector:
+    def __init__(self, model, test_dataset, batch_size=32):
+        self.model = model
+        self.model.eval()
+        self.loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+        # Feature names in the order used by MultiTrialWCST.card_features
+        self.features = ['Colour', 'Shape', 'Quantity']
+        self.num_layers = len(self.model.layers)
+        # infer heads from first layer
+        self.num_heads = self.model.layers[0].attn.h
+
+    @staticmethod
+    def card_features(idx: int):
+        qty = idx % 4
+        shp = (idx // 4) % 4
+        col = (idx // 16) % 4
+        return (col, shp, qty)
+
+    def _final_trial_positions(self, seq_1d):
+        seq = seq_1d.tolist()
+        try:
+            sep_idx = len(seq) - 1 - seq[::-1].index(SEP)
+        except ValueError:
+            return None  # no SEP found
+
+        cat_positions = [sep_idx - 6, sep_idx - 5, sep_idx - 4, sep_idx - 3]
+        if min(cat_positions) < 0:
+            return None
+        q_pos = sep_idx - 1
+        if q_pos < 0:
+            return None
+        return sep_idx, cat_positions, q_pos
+
+    def analyze(self):
+        head_feature_scores = {
+            (layer, head): {'Colour': 0.0, 'Shape': 0.0, 'Quantity': 0.0, 'Count': 0}
+            for layer in range(self.num_layers)
+            for head in range(self.num_heads)
+        }
+
+        with torch.no_grad():
+            for batch in self.loader:
+                X = batch[0].to(device)
+
+                logits, attn_all = self.model(X, return_attn=True)  # list of length num_layers; each (B,H,T,T)
+
+                for b in range(X.size(0)):
+                    pos_info = self._final_trial_positions(X[b].cpu())
+                    if pos_info is None:
+                        continue
+                    sep_idx, cat_positions, q_pos = pos_info
+
+                    q_card_idx = int(X[b, q_pos].item())
+                    q_feat = self.card_features(q_card_idx)
+
+                    cat_feats = [self.card_features(int(X[b, p].item())) for p in cat_positions]
+
+                    match_positions = {
+                        'Colour': [cat_positions[i] for i in range(4) if cat_feats[i][0] == q_feat[0]],
+                        'Shape':  [cat_positions[i] for i in range(4) if cat_feats[i][1] == q_feat[1]],
+                        'Quantity':[cat_positions[i] for i in range(4) if cat_feats[i][2] == q_feat[2]],
+                    }
+
+                    for layer_idx, w in enumerate(attn_all):
+                        # w: (B, H, T, T)
+                        w_b = w[b]  # (H, T, T)
+                        # Attention row for the SEP query (predicting the label token)
+                        row = w_b[:, sep_idx, :]  # (H, T)
+                        for feature_name, pos_list in match_positions.items():
+                            if not pos_list:
+                                continue
+                            # Sum attention to the matched category positions
+                            attn_sum = row[:, pos_list].sum(dim=-1)  # (H,)
+                            for head_idx in range(self.num_heads):
+                                key = (layer_idx, head_idx)
+                                head_feature_scores[key][feature_name] += float(attn_sum[head_idx].item())
+                                head_feature_scores[key]['Count'] += 1
+
+        average_scores = {}
+        for key, data in head_feature_scores.items():
+            if data['Count'] > 0:
+                average_scores[key] = {
+                    f: data[f] / data['Count']
+                    for f in self.features
+                }
+            else:
+                average_scores[key] = {f: 0.0 for f in self.features}
+
+        return average_scores
+
+    def visualize(self, average_scores, outfile='attention.png'):
+        rows = []
+        for (layer, head), scores in average_scores.items():
+            for feat, val in scores.items():
+                rows.append({'Layer': f'L{layer}', 'Head': head, 'Feature': feat, 'Attention_Score': val})
+        df = pd.DataFrame(rows)
+
+        # Plot heatmaps
+        n_layers = self.num_layers
+        fig, axes = plt.subplots(n_layers, 1, figsize=(10, 3*n_layers), sharex=True)
+        if n_layers == 1:
+            axes = [axes]
+
+        for layer_idx, ax in enumerate(axes):
+            layer_df = df[df['Layer'] == f'L{layer_idx}']
+            pivot = layer_df.pivot_table(index='Head', columns='Feature', values='Attention_Score')
+            sns.heatmap(pivot, annot=True, fmt=".3f", cmap="YlGnBu",
+                        cbar_kws={'label': 'Avg Attention to Matching Cat Cards'}, ax=ax)
+            ax.set_title(f'Decoder Self-Attention Specialization - Layer {layer_idx}')
+            ax.set_ylabel('Head')
+
+        plt.tight_layout()
+        plt.savefig(outfile, dpi=150)
+        plt.close()
+        print(f"✓ Attention heatmaps saved -> {outfile}")
+
+def main():
+    print("="*20)
+    print("WCST TRANSFORMER TRAINING")
+    print("="*20)
+    
+    print(f"\nConfiguration:")
+    print(f"  Training size: {TRAINING_SIZE}")
+    print(f"  Context trials: {NUM_CONTEXT_TRIALS}")
+    print(f"  Batch size: {BATCH_SIZE} (accumulation: {ACCUMULATION_STEPS}x)")
+    print(f"  Effective batch: {BATCH_SIZE * ACCUMULATION_STEPS}")
+    print(f"  Model: d_model={D_MODEL}, heads={NUM_HEADS}, layers={NUM_LAYERS}")
+    print(f"  Learning rate: {LEARNING_RATE}")
+    print(f"  Device: {device}")
+    
+    # Generate data
+    loader = MultiTrialDatasetLoader(
+        training_size=TRAINING_SIZE,
+        train_split=TRAIN_SPLIT,
+        val_split=VAL_SPLIT,
+        test_split=TEST_SPLIT,
+        num_context_trials=NUM_CONTEXT_TRIALS,
+        context_switch_interval=CONTEXT_SWITCH_INTERVAL,
+        batch_size=BATCH_SIZE
+    )
+    train_data, val_data, test_data, max_len = loader.load_data()
+    
+    print(f"\n Data loaded successfully")
+    
+    # Build model
+    print("\nBuilding model...")
+    model = TransformerDecoderOnly(
+        num_layers=NUM_LAYERS,
+        d_model=D_MODEL,
+        num_heads=NUM_HEADS,
+        d_ff=D_FF,
+        vocab_size=VOCAB_SIZE,
+        max_len=max_len+1,
+        dropout=DROPOUT
+    ).to(device)
+    
+    model.fc_out.weight = model.emb.emb.weight
+    
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"  Total parameters: {total_params:,}")
+    print(f"  Model size: ~{total_params * 4 / 1e6:.1f} MB")
+    
+    # Train
+    trainer = ImprovedWCSTTrainer(
+        model=model,
+        train_data=train_data,
+        val_data=val_data,
+        test_data=test_data,
+        lr=LEARNING_RATE,
+        batch_size=BATCH_SIZE,
+        patience=PATIENCE,
+        epochs=EPOCHS,
+        weight_decay=WEIGHT_DECAY,
+        accumulation_steps=ACCUMULATION_STEPS
+    )
+    trainer.train()
+    
+    print("\nRunning detector on test set...")
+
+    model.load_state_dict(torch.load("best_wcst_multi.pth", map_location=device))
+    detector = RuleDetector(model, test_data, batch_size=32)
+    avg_scores = detector.analyze()
+    detector.visualize(avg_scores, outfile='attention.png')
+
+    print("\n  Done! Artifacts:")
+    print("  - best_wcst_multi.pth")
+    print("  - final_weights.pth")
+    print("  - training_curves.png")
+    print("  - attention.png")
+
+
+if __name__ == "__main__":
+    main()
